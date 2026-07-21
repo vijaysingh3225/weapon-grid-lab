@@ -30,6 +30,9 @@ export type PlacedItem = {
   x: number;
   y: number;
   rotation: Rotation;
+  growthStreamId?: string;
+  growthParentInstanceId?: string;
+  growthOriginNodeInstanceId?: string;
 };
 
 export type PatternRequirement = Coord & {
@@ -81,4 +84,3 @@ export type WorkspaceData = {
   history: HistoryEvent[];
   updatedAt: string;
 };
-

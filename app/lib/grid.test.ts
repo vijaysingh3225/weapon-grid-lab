@@ -4,7 +4,10 @@ import type { Coord, PlacedItem } from "../types";
 import {
   canPlaceItem,
   chooseGrowthCandidate,
+  chooseGrowthBranchCandidate,
   detectStructures,
+  getGrowthConnectionStreamId,
+  getGrowthBranchCandidates,
   getGrowthCandidates,
   getItemAnchorAtPoint,
   getItemCenter,
@@ -46,6 +49,219 @@ describe("growth frontier", () => {
     const sharedCandidate = candidates.find(({ x, y }) => x === 1 && y === 0);
     expect(sharedCandidate?.weight).toBeCloseTo(1.1);
     expect(candidates.reduce((sum, candidate) => sum + candidate.probability, 0)).toBeCloseTo(1);
+  });
+
+  it("offers empty populated cells beside a growth node", () => {
+    const cells: Coord[] = [
+      { x: 0, y: 0 },
+      { x: 1, y: 0 },
+      { x: -1, y: 0 },
+      { x: 0, y: 1 },
+      { x: 0, y: -1 },
+    ];
+    const placements: PlacedItem[] = [
+      { instanceId: "node", itemId: "growth-node", x: 0, y: 0, rotation: 0 },
+      { instanceId: "blocked", itemId: "iron-shard", x: 0, y: -1, rotation: 0 },
+    ];
+
+    expect(
+      getGrowthBranchCandidates(cells, placements, BUILT_IN_ITEMS),
+    ).toEqual([
+      {
+        source: { x: 0, y: 0 },
+        target: { x: -1, y: 0 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 1, y: 0 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 0, y: 1 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+    ]);
+  });
+
+  it("extends explicit reachable tips without growing from branch segments", () => {
+    const cells: Coord[] = [
+      { x: 0, y: 0 },
+      { x: -1, y: 0 },
+      { x: 0, y: -1 },
+      { x: 0, y: 1 },
+      { x: 1, y: 0 },
+      { x: 1, y: -1 },
+      { x: 1, y: 1 },
+      { x: 2, y: 0 },
+      { x: 2, y: -1 },
+      { x: 2, y: 1 },
+      { x: 3, y: 0 },
+    ];
+    const placements: PlacedItem[] = [
+      { instanceId: "node", itemId: "growth-node", x: 0, y: 0, rotation: 0 },
+      {
+        instanceId: "branch-1",
+        itemId: "growth-branch",
+        x: 1,
+        y: 0,
+        rotation: 0,
+        growthStreamId: "stream-a",
+        growthParentInstanceId: "node",
+      },
+      {
+        instanceId: "tip",
+        itemId: "growth-tip",
+        x: 2,
+        y: 0,
+        rotation: 0,
+        growthStreamId: "stream-a",
+        growthParentInstanceId: "branch-1",
+      },
+    ];
+    const candidates = getGrowthBranchCandidates(
+      cells,
+      placements,
+      BUILT_IN_ITEMS,
+    );
+
+    expect(candidates).toEqual([
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 0, y: -1 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 2, y: 0 },
+        target: { x: 2, y: -1 },
+        sourceInstanceId: "tip",
+        sourceItemId: "growth-tip",
+        growthStreamId: "stream-a",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: -1, y: 0 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 2, y: 0 },
+        target: { x: 3, y: 0 },
+        sourceInstanceId: "tip",
+        sourceItemId: "growth-tip",
+        growthStreamId: "stream-a",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 0, y: 1 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 2, y: 0 },
+        target: { x: 2, y: 1 },
+        sourceInstanceId: "tip",
+        sourceItemId: "growth-tip",
+        growthStreamId: "stream-a",
+      },
+    ]);
+    expect(candidates.map(({ target }) => target)).not.toContainEqual({ x: 1, y: -1 });
+    expect(candidates.map(({ target }) => target)).not.toContainEqual({ x: 1, y: 1 });
+    expect(candidates.map(({ sourceInstanceId }) => sourceInstanceId)).not.toContain("branch-1");
+  });
+
+  it("keeps adjacent branch streams visually independent", () => {
+    const branchA: PlacedItem = {
+      instanceId: "branch-a",
+      itemId: "growth-branch",
+      x: 1,
+      y: 0,
+      rotation: 0,
+      growthStreamId: "stream-a",
+      growthParentInstanceId: "node",
+    };
+    const branchB: PlacedItem = {
+      instanceId: "branch-b",
+      itemId: "growth-branch",
+      x: 1,
+      y: 1,
+      rotation: 0,
+      growthStreamId: "stream-b",
+      growthParentInstanceId: "branch-a",
+    };
+
+    expect(getGrowthConnectionStreamId(branchA, branchB)).toBeUndefined();
+  });
+
+  it("stops a node from creating more than four persistent streams", () => {
+    const cells: Coord[] = [
+      { x: 0, y: 0 },
+      { x: 0, y: -1 },
+      { x: 1, y: 0 },
+      { x: 0, y: 1 },
+      { x: -1, y: 0 },
+    ];
+    const placements: PlacedItem[] = [
+      { instanceId: "node", itemId: "growth-node", x: 0, y: 0, rotation: 0 },
+      ...["a", "b", "c", "d"].map((label, index): PlacedItem => ({
+        instanceId: `old-${label}`,
+        itemId: "growth-branch",
+        x: index + 10,
+        y: 10,
+        rotation: 0,
+        growthStreamId: `stream-${label}`,
+        growthOriginNodeInstanceId: "node",
+      })),
+    ];
+
+    expect(
+      getGrowthBranchCandidates(cells, placements, BUILT_IN_ITEMS),
+    ).toEqual([]);
+  });
+
+  it("requires a connected growth node and chooses branch growth repeatably", () => {
+    const cells: Coord[] = [
+      { x: 0, y: 0 },
+      { x: 1, y: 0 },
+      { x: 2, y: 0 },
+    ];
+    const orphanBranch: PlacedItem[] = [
+      { instanceId: "branch", itemId: "growth-branch", x: 1, y: 0, rotation: 0 },
+      { instanceId: "tip", itemId: "growth-tip", x: 2, y: 0, rotation: 0 },
+    ];
+    expect(
+      getGrowthBranchCandidates(cells, orphanBranch, BUILT_IN_ITEMS),
+    ).toEqual([]);
+
+    const choices = [
+      {
+        source: { x: 0, y: 0 },
+        target: { x: -1, y: 0 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 1, y: 0 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+      {
+        source: { x: 0, y: 0 },
+        target: { x: 0, y: 1 },
+        sourceInstanceId: "node",
+        sourceItemId: "growth-node",
+      },
+    ];
+    const randomValue = seededRandom("branch-seed", 3);
+    expect(chooseGrowthBranchCandidate(choices, randomValue)).toEqual(
+      chooseGrowthBranchCandidate(choices, randomValue),
+    );
   });
 });
 

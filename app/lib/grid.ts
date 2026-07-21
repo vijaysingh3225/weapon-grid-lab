@@ -172,6 +172,159 @@ export function getGrowthCandidates(
     .sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
+export type GrowthBranchCandidate = {
+  source: Coord;
+  target: Coord;
+  sourceInstanceId: string;
+  sourceItemId: string;
+  growthStreamId?: string;
+  growthOriginNodeInstanceId?: string;
+};
+
+function isOrthogonallyAdjacent(a: Coord, b: Coord): boolean {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y) === 1;
+}
+
+export function getGrowthConnectionStreamId(
+  a: PlacedItem,
+  b: PlacedItem,
+): string | undefined {
+  if (!isOrthogonallyAdjacent(a, b)) return undefined;
+  if (
+    a.growthStreamId &&
+    b.growthStreamId &&
+    a.growthStreamId !== b.growthStreamId
+  ) {
+    return undefined;
+  }
+  const linked =
+    a.growthParentInstanceId === b.instanceId ||
+    b.growthParentInstanceId === a.instanceId;
+  return linked ? a.growthStreamId ?? b.growthStreamId : undefined;
+}
+
+function hasConnectedGrowthLineage(
+  tip: PlacedItem,
+  placementsById: Map<string, PlacedItem>,
+  nodeItemId: string,
+  branchItemId: string,
+  tipItemId: string,
+): boolean {
+  if (!tip.growthStreamId || !tip.growthParentInstanceId) return false;
+  const visited = new Set([tip.instanceId]);
+  let current = tip;
+
+  while (current.growthParentInstanceId) {
+    const parent = placementsById.get(current.growthParentInstanceId);
+    if (
+      !parent ||
+      visited.has(parent.instanceId) ||
+      !isOrthogonallyAdjacent(current, parent)
+    ) {
+      return false;
+    }
+    if (parent.itemId === nodeItemId) {
+      return (
+        !tip.growthOriginNodeInstanceId ||
+        tip.growthOriginNodeInstanceId === parent.instanceId
+      );
+    }
+    if (
+      (parent.itemId !== branchItemId && parent.itemId !== tipItemId) ||
+      parent.growthStreamId !== tip.growthStreamId
+    ) {
+      return false;
+    }
+    visited.add(parent.instanceId);
+    current = parent;
+  }
+
+  return false;
+}
+
+export function getGrowthBranchCandidates(
+  cells: Coord[],
+  placements: PlacedItem[],
+  items: ItemDefinition[],
+  nodeItemId = "growth-node",
+  branchItemId = "growth-branch",
+  tipItemId = "growth-tip",
+): GrowthBranchCandidate[] {
+  const cellKeys = new Set(cells.map(coordKey));
+  const occupied = buildOccupancyMap(placements, items);
+  const placementsById = new Map(
+    placements.map((placement) => [placement.instanceId, placement]),
+  );
+  const streamIdsByOriginNode = new Map<string, Set<string>>();
+  for (const placement of placements) {
+    if (!placement.growthOriginNodeInstanceId || !placement.growthStreamId) {
+      continue;
+    }
+    const streamIds =
+      streamIdsByOriginNode.get(placement.growthOriginNodeInstanceId) ??
+      new Set<string>();
+    streamIds.add(placement.growthStreamId);
+    streamIdsByOriginNode.set(placement.growthOriginNodeInstanceId, streamIds);
+  }
+  const growthSources = placements.filter(
+    (placement) =>
+      (placement.itemId === nodeItemId &&
+        (streamIdsByOriginNode.get(placement.instanceId)?.size ?? 0) < 4) ||
+      (placement.itemId === tipItemId &&
+        hasConnectedGrowthLineage(
+          placement,
+          placementsById,
+          nodeItemId,
+          branchItemId,
+          tipItemId,
+        )),
+  );
+
+  const candidates: GrowthBranchCandidate[] = [];
+  for (const source of growthSources) {
+    for (const direction of ORTHOGONAL_DIRECTIONS) {
+      const target = {
+        x: source.x + direction.x,
+        y: source.y + direction.y,
+      };
+      const key = coordKey(target);
+      if (!cellKeys.has(key) || occupied.has(key)) continue;
+      candidates.push({
+        source: { x: source.x, y: source.y },
+        target,
+        sourceInstanceId: source.instanceId,
+        sourceItemId: source.itemId,
+        ...(source.growthStreamId
+          ? { growthStreamId: source.growthStreamId }
+          : {}),
+        ...(source.growthOriginNodeInstanceId
+          ? { growthOriginNodeInstanceId: source.growthOriginNodeInstanceId }
+          : {}),
+      });
+    }
+  }
+
+  return candidates.sort(
+    (a, b) =>
+      a.target.y - b.target.y ||
+      a.target.x - b.target.x ||
+      a.source.y - b.source.y ||
+      a.source.x - b.source.x,
+  );
+}
+
+export function chooseGrowthBranchCandidate(
+  candidates: GrowthBranchCandidate[],
+  randomValue: number,
+): GrowthBranchCandidate | undefined {
+  if (candidates.length === 0) return undefined;
+  const index = Math.min(
+    candidates.length - 1,
+    Math.floor(Math.max(0, randomValue) * candidates.length),
+  );
+  return candidates[index];
+}
+
 export function isConnected(cells: Coord[]): boolean {
   if (cells.length === 0) return false;
   const remaining = new Set(cells.map(coordKey));

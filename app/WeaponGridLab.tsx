@@ -19,8 +19,11 @@ import {
   calculateStats,
   canPlaceItem,
   chooseGrowthCandidate,
+  chooseGrowthBranchCandidate,
   coordKey,
   detectStructures,
+  getGrowthConnectionStreamId,
+  getGrowthBranchCandidates,
   getGrowthCandidates,
   getItemAnchorAtPoint,
   getItemCenter,
@@ -50,6 +53,7 @@ const CELL_SIZE = 64;
 const CELL_PITCH = 72;
 const MAX_UNDO = 40;
 const STAT_KEYS: StatKey[] = ["power", "speed", "stability", "critical"];
+const GROWTH_STREAM_COLORS = ["#82b66c", "#c3a15f", "#62aaa0", "#ba7968"];
 
 type DragState = {
   itemId: string;
@@ -286,6 +290,71 @@ export function WeaponGridLab() {
     [workspace.placedItems, workspace.items],
   );
 
+  const branchCandidates = useMemo(
+    () =>
+      getGrowthBranchCandidates(
+        workspace.cells,
+        workspace.placedItems,
+        workspace.items,
+      ),
+    [workspace.cells, workspace.placedItems, workspace.items],
+  );
+
+  const activeGrowthTipIds = useMemo(
+    () =>
+      new Set(
+        branchCandidates
+          .filter((candidate) => candidate.sourceItemId === "growth-tip")
+          .map((candidate) => candidate.sourceInstanceId),
+      ),
+    [branchCandidates],
+  );
+
+  const growthPlacementsByCoord = useMemo(
+    () =>
+      new Map(
+        workspace.placedItems
+          .filter((placement) =>
+            ["growth-node", "growth-branch", "growth-tip"].includes(
+              placement.itemId,
+            ),
+          )
+          .map((placement) => [coordKey(placement), placement]),
+      ),
+    [workspace.placedItems],
+  );
+
+  const growthStreams = useMemo(() => {
+    const streamIds = workspace.placedItems.reduce<string[]>((ids, placement) => {
+      if (
+        placement.growthStreamId &&
+        !ids.includes(placement.growthStreamId)
+      ) {
+        ids.push(placement.growthStreamId);
+      }
+      return ids;
+    }, []);
+
+    return streamIds.map((id, index) => {
+      const tip = workspace.placedItems.find(
+        (placement) =>
+          placement.growthStreamId === id && placement.itemId === "growth-tip",
+      );
+      return {
+        id,
+        label: String.fromCharCode(65 + index),
+        color: GROWTH_STREAM_COLORS[index % GROWTH_STREAM_COLORS.length],
+        tip,
+        active: tip ? activeGrowthTipIds.has(tip.instanceId) : false,
+      };
+    });
+  }, [activeGrowthTipIds, workspace.placedItems]);
+
+  const growthStreamById = useMemo(
+    () => new Map(growthStreams.map((stream) => [stream.id, stream])),
+    [growthStreams],
+  );
+
   const selectedPlacement = workspace.placedItems.find(
     (placement) => placement.instanceId === selectedInstanceId,
   );
@@ -321,18 +390,74 @@ export function WeaponGridLab() {
     const randomValue = seededRandom(workspace.seed, workspace.growthStep);
     const chosen = chooseGrowthCandidate(candidates, randomValue);
     if (!chosen) return;
+    const nextCell = { x: chosen.x, y: chosen.y };
+    const nextCells = [...workspace.cells, nextCell];
+    const nextBranchCandidates = getGrowthBranchCandidates(
+      nextCells,
+      workspace.placedItems,
+      workspace.items,
+    );
+    const branchChoice = chooseGrowthBranchCandidate(
+      nextBranchCandidates,
+      seededRandom(`${workspace.seed}:growth-branch`, workspace.growthStep),
+    );
+    const tipPlacement: PlacedItem | undefined = branchChoice
+      ? {
+          instanceId: createId("tip"),
+          itemId: "growth-tip",
+          x: branchChoice.target.x,
+          y: branchChoice.target.y,
+          rotation: 0,
+          growthStreamId:
+            branchChoice.growthStreamId ?? createId("growth-stream"),
+          growthParentInstanceId: branchChoice.sourceInstanceId,
+          growthOriginNodeInstanceId:
+            branchChoice.growthOriginNodeInstanceId ??
+            branchChoice.sourceInstanceId,
+        }
+      : undefined;
+    const hasGrowthNode = workspace.placedItems.some(
+      (placement) => placement.itemId === "growth-node",
+    );
+    const branchLabel = branchChoice?.growthStreamId
+      ? growthStreamById.get(branchChoice.growthStreamId)?.label ?? "?"
+      : String.fromCharCode(65 + growthStreams.length);
+    const branchMessage = tipPlacement && branchChoice
+      ? branchChoice.sourceItemId === "growth-tip"
+        ? ` Branch ${branchLabel} advanced: its old Tip at (${branchChoice.source.x}, ${branchChoice.source.y}) became a segment and its new Tip reached (${tipPlacement.x}, ${tipPlacement.y}).`
+        : ` Growth Node started Branch ${branchLabel} with a Tip at (${tipPlacement.x}, ${tipPlacement.y}).`
+      : hasGrowthNode
+        ? " No Growth Node or Tip had an open populated slot."
+        : "";
     commit(
       (current) => ({
         ...current,
-        cells: [...current.cells, { x: chosen.x, y: chosen.y }],
+        cells: [...current.cells, nextCell],
+        placedItems: tipPlacement && branchChoice
+          ? [
+              ...current.placedItems.map((placement) =>
+                branchChoice.sourceItemId === "growth-tip" &&
+                placement.instanceId === branchChoice.sourceInstanceId
+                  ? { ...placement, itemId: "growth-branch" }
+                  : placement,
+              ),
+              tipPlacement,
+            ]
+          : current.placedItems,
         growthStep: current.growthStep + 1,
       }),
       createEvent(
         "growth",
-        `Level growth chose (${chosen.x}, ${chosen.y}) at ${(chosen.probability * 100).toFixed(1)}%.`,
+        `Level growth chose (${chosen.x}, ${chosen.y}) at ${(chosen.probability * 100).toFixed(1)}%.${branchMessage}`,
       ),
     );
-    setSelectedCell({ x: chosen.x, y: chosen.y });
+    if (tipPlacement) {
+      setSelectedCell(null);
+      setSelectedInstanceId(tipPlacement.instanceId);
+    } else {
+      setSelectedCell(nextCell);
+      setSelectedInstanceId(null);
+    }
   };
 
   const removeSelectedCell = () => {
@@ -513,7 +638,14 @@ export function WeaponGridLab() {
     if (!definition) return;
 
     if (dragState?.instanceId) {
-      const moved = { ...previewPlacement, instanceId: dragState.instanceId };
+      const original = workspace.placedItems.find(
+        (placement) => placement.instanceId === dragState.instanceId,
+      );
+      const moved = {
+        ...original,
+        ...previewPlacement,
+        instanceId: dragState.instanceId,
+      };
       commit(
         (current) => ({
           ...current,
@@ -739,7 +871,26 @@ export function WeaponGridLab() {
         <aside className="left-rail panel-rail">
           <section className="panel-section growth-panel">
             <div className="section-heading"><div><p className="eyebrow">LEVEL DEVELOPMENT</p><h2>Growth simulator</h2></div><span className="level-badge">LV {workspace.cells.length}</span></div>
-            <p className="panel-copy">Every unique edge-connected opening begins with equal weight. Growth items adjust that weight before normalization.</p>
+            <p className="panel-copy">Every unique edge-connected opening begins with equal weight. A Growth Node can start up to four independent streams—one per side. Each stream keeps its own lineage and never joins a neighboring branch.</p>
+            <div className="branch-tracker" aria-label="Live branch endpoints">
+              <header><strong>Live endpoints</strong><span>{growthStreams.length} {growthStreams.length === 1 ? "stream" : "streams"}</span></header>
+              {growthStreams.length > 0 ? growthStreams.map((stream) => (
+                <button
+                  key={stream.id}
+                  type="button"
+                  disabled={!stream.tip}
+                  onClick={() => {
+                    if (!stream.tip) return;
+                    setSelectedInstanceId(stream.tip.instanceId);
+                    setSelectedCell(null);
+                  }}
+                >
+                  <i style={{ "--stream-color": stream.color } as CSSProperties}>{stream.label}</i>
+                  <span>{stream.tip ? `Tip (${stream.tip.x}, ${stream.tip.y})` : "Tip removed"}</span>
+                  <b className={stream.active ? "is-open" : "is-capped"}>{stream.active ? "OPEN" : "CAPPED"}</b>
+                </button>
+              )) : <p>Place a Growth Node and simulate growth to start Branch A–D.</p>}
+            </div>
             <button className="primary-action" onClick={simulateGrowth}><span>Simulate growth</span><small>{candidates.length} possible positions</small></button>
             <div className="seed-row">
               <label><span>Random seed</span><input value={workspace.seed} onChange={(event) => replaceWithoutUndo((current) => ({ ...current, seed: event.target.value, growthStep: 0 }))} /></label>
@@ -789,7 +940,82 @@ export function WeaponGridLab() {
                 const height = (dimensions.height - 1) * CELL_PITCH + CELL_SIZE;
                 const originalWidth = (item.width - 1) * CELL_PITCH + CELL_SIZE;
                 const originalHeight = (item.height - 1) * CELL_PITCH + CELL_SIZE;
-                return <div className={`placed-item ${placement.instanceId === selectedInstanceId ? "is-selected" : ""}`} key={placement.instanceId} draggable onDragStart={(event) => beginItemDrag(event, item, placement)} onDragEnd={endItemDrag} onClick={(event) => { event.stopPropagation(); setSelectedInstanceId(placement.instanceId); setSelectedCell(null); }} style={{ left: center.x * CELL_PITCH, top: center.y * CELL_PITCH, width, height, "--item-color": item.color } as CSSProperties} title={`${item.name} · ${item.width}×${item.height} · ${placement.rotation}°`}><div className="item-art" style={{ width: originalWidth, height: originalHeight, transform: `translate(-50%, -50%) rotate(${placement.rotation}deg)` }}>{item.imageDataUrl ? <img src={item.imageDataUrl} alt="" draggable={false} /> : <span>{item.symbol}</span>}<small>{item.name}</small></div></div>;
+                const isGrowthNetworkItem = [
+                  "growth-node",
+                  "growth-branch",
+                  "growth-tip",
+                ].includes(item.id);
+                const isActiveTip =
+                  item.id === "growth-tip" &&
+                  activeGrowthTipIds.has(placement.instanceId);
+                const stream = placement.growthStreamId
+                  ? growthStreamById.get(placement.growthStreamId)
+                  : undefined;
+                const connectionStreamAt = (x: number, y: number) => {
+                  const neighbor = growthPlacementsByCoord.get(coordKey({ x, y }));
+                  if (!neighbor) return null;
+                  return getGrowthConnectionStreamId(placement, neighbor) ?? null;
+                };
+                const connections = isGrowthNetworkItem
+                  ? {
+                      north: connectionStreamAt(placement.x, placement.y - 1),
+                      east: connectionStreamAt(placement.x + 1, placement.y),
+                      south: connectionStreamAt(placement.x, placement.y + 1),
+                      west: connectionStreamAt(placement.x - 1, placement.y),
+                    }
+                  : null;
+                const tipState = item.id === "growth-tip"
+                  ? isActiveTip ? "open" : "capped"
+                  : null;
+
+                return (
+                  <div
+                    className={`placed-item ${placement.instanceId === selectedInstanceId ? "is-selected" : ""} ${isGrowthNetworkItem ? "is-growth-network" : ""} ${tipState ? `is-growth-tip-${tipState}` : ""}`}
+                    key={placement.instanceId}
+                    draggable
+                    onDragStart={(event) => beginItemDrag(event, item, placement)}
+                    onDragEnd={endItemDrag}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setSelectedInstanceId(placement.instanceId);
+                      setSelectedCell(null);
+                    }}
+                    style={{
+                      left: center.x * CELL_PITCH,
+                      top: center.y * CELL_PITCH,
+                      width,
+                      height,
+                      "--item-color": item.color,
+                      "--stream-color": stream?.color ?? item.color,
+                    } as CSSProperties}
+                    title={`${item.name}${stream ? ` · Branch ${stream.label}` : ""}${tipState ? ` · ${tipState}` : ""} · ${item.width}×${item.height} · ${placement.rotation}°`}
+                  >
+                    {isGrowthNetworkItem && connections ? (
+                      <div className="growth-network-art" aria-hidden="true">
+                        {connections.north && <i className="growth-pipe-arm arm-north" style={{ "--stream-color": growthStreamById.get(connections.north)?.color } as CSSProperties} />}
+                        {connections.east && <i className="growth-pipe-arm arm-east" style={{ "--stream-color": growthStreamById.get(connections.east)?.color } as CSSProperties} />}
+                        {connections.south && <i className="growth-pipe-arm arm-south" style={{ "--stream-color": growthStreamById.get(connections.south)?.color } as CSSProperties} />}
+                        {connections.west && <i className="growth-pipe-arm arm-west" style={{ "--stream-color": growthStreamById.get(connections.west)?.color } as CSSProperties} />}
+                        <span className={`growth-pipe-core is-${item.id}`}>
+                          {item.id === "growth-node" ? "G" : item.id === "growth-tip" ? stream?.label ?? "?" : ""}
+                        </span>
+                        {tipState && <small>{stream?.label ?? "?"} · {tipState}</small>}
+                      </div>
+                    ) : (
+                      <div
+                        className="item-art"
+                        style={{
+                          width: originalWidth,
+                          height: originalHeight,
+                          transform: `translate(-50%, -50%) rotate(${placement.rotation}deg)`,
+                        }}
+                      >
+                        {item.imageDataUrl ? <img src={item.imageDataUrl} alt="" draggable={false} /> : <span>{item.symbol}</span>}
+                        <small>{item.name}</small>
+                      </div>
+                    )}
+                  </div>
+                );
               })}
               {previewPlacement && previewItem && previewCenter && <div className={`placement-preview ${previewValid ? "is-valid" : "is-invalid"}`} style={{ left: previewCenter.x * CELL_PITCH, top: previewCenter.y * CELL_PITCH, width: (getItemDimensions(previewItem, previewPlacement.rotation).width - 1) * CELL_PITCH + CELL_SIZE, height: (getItemDimensions(previewItem, previewPlacement.rotation).height - 1) * CELL_PITCH + CELL_SIZE }}>{previewValid ? "PLACE" : "BLOCKED"}</div>}
             </div>
